@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>什么值得投</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+  body { font-family: 'Inter', system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+  .glass { background: rgba(30,41,59,0.7); backdrop-filter: blur(12px); border: 1px solid rgba(148,163,184,0.1); }
+  .glow-s { box-shadow: 0 0 20px rgba(220,38,38,0.15); }
+  .glow-a { box-shadow: 0 0 20px rgba(234,88,12,0.12); }
+  .pipeline-step { transition: all 0.4s ease; }
+  .pipeline-step.active { transform: scale(1.05); }
+  .pipeline-step.done { opacity: 1; }
+  .pipeline-step.pending { opacity: 0.4; }
+  .score-bar { transition: width 0.8s ease; }
+  .fade-in { animation: fadeIn 0.5s ease forwards; }
+  @keyframes fadeIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+  @keyframes pulse-dot { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+  .pulse-dot { animation: pulse-dot 1s ease-in-out infinite; }
+  ::-webkit-scrollbar { width:6px; } ::-webkit-scrollbar-thumb { background:#334155; border-radius:3px; }
+</style>
+</head>
+<body class="min-h-screen">
+
+<!-- Header -->
+<header class="border-b border-slate-700/50 px-6 py-4">
+  <div class="max-w-7xl mx-auto flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="text-2xl">💰</div>
+      <div>
+        <h1 class="text-lg font-bold text-white">什么值得投</h1>
+        <p class="text-xs text-slate-400">AI 多智能体商机发掘系统</p>
+      </div>
+    </div>
+    <div id="mode-badge" class="px-3 py-1 rounded-full text-xs font-medium bg-slate-700 text-slate-300"></div>
+  </div>
+</header>
+
+<main class="max-w-7xl mx-auto px-6 py-6 space-y-6">
+
+  <!-- Pipeline Control -->
+  <section class="glass rounded-xl p-6">
+    <div class="flex items-center justify-between mb-6">
+      <h2 class="text-base font-semibold text-white">Agent 流水线</h2>
+      <button id="run-btn" onclick="runPipeline()"
+        class="px-5 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+        ▶ 运行分析
+      </button>
+    </div>
+    <div id="pipeline-steps" class="flex items-center justify-between gap-2">
+      <div class="pipeline-step pending flex flex-col items-center gap-2 flex-1" data-agent="crawler">
+        <div class="w-12 h-12 rounded-xl bg-slate-700/50 flex items-center justify-center text-xl" id="icon-crawler">🕷️</div>
+        <span class="text-xs text-slate-400">爬虫</span>
+      </div>
+      <div class="text-slate-600">→</div>
+      <div class="pipeline-step pending flex flex-col items-center gap-2 flex-1" data-agent="cleaner">
+        <div class="w-12 h-12 rounded-xl bg-slate-700/50 flex items-center justify-center text-xl" id="icon-cleaner">🧹</div>
+        <span class="text-xs text-slate-400">清洗</span>
+      </div>
+      <div class="text-slate-600">→</div>
+      <div class="pipeline-step pending flex flex-col items-center gap-2 flex-1" data-agent="integrator">
+        <div class="w-12 h-12 rounded-xl bg-slate-700/50 flex items-center justify-center text-xl" id="icon-integrator">🧩</div>
+        <span class="text-xs text-slate-400">整合</span>
+      </div>
+      <div class="text-slate-600">→</div>
+      <div class="pipeline-step pending flex flex-col items-center gap-2 flex-1" data-agent="analyst">
+        <div class="w-12 h-12 rounded-xl bg-slate-700/50 flex items-center justify-center text-xl" id="icon-analyst">🔬</div>
+        <span class="text-xs text-slate-400">分析</span>
+      </div>
+      <div class="text-slate-600">→</div>
+      <div class="pipeline-step pending flex flex-col items-center gap-2 flex-1" data-agent="evaluator">
+        <div class="w-12 h-12 rounded-xl bg-slate-700/50 flex items-center justify-center text-xl" id="icon-evaluator">⚖️</div>
+        <span class="text-xs text-slate-400">评估</span>
+      </div>
+      <div class="text-slate-600">→</div>
+      <div class="pipeline-step pending flex flex-col items-center gap-2 flex-1" data-agent="reporter">
+        <div class="w-12 h-12 rounded-xl bg-slate-700/50 flex items-center justify-center text-xl" id="icon-reporter">📊</div>
+        <span class="text-xs text-slate-400">报告</span>
+      </div>
+    </div>
+    <div id="pipeline-log" class="mt-4 text-xs text-slate-500 h-6"></div>
+  </section>
+
+  <!-- Results -->
+  <div id="results" class="hidden space-y-6 fade-in">
+
+    <!-- Stats -->
+    <div class="grid grid-cols-4 gap-4">
+      <div class="glass rounded-xl p-4 text-center">
+        <div class="text-2xl font-bold text-white" id="stat-total">0</div>
+        <div class="text-xs text-slate-400 mt-1">发现商机</div>
+      </div>
+      <div class="glass rounded-xl p-4 text-center">
+        <div class="text-2xl font-bold text-red-400" id="stat-s">0</div>
+        <div class="text-xs text-slate-400 mt-1">S级 · 重大</div>
+      </div>
+      <div class="glass rounded-xl p-4 text-center">
+        <div class="text-2xl font-bold text-orange-400" id="stat-a">0</div>
+        <div class="text-xs text-slate-400 mt-1">A级 · 高价值</div>
+      </div>
+      <div class="glass rounded-xl p-4 text-center">
+        <div class="text-2xl font-bold text-yellow-400" id="stat-b">0</div>
+        <div class="text-xs text-slate-400 mt-1">B级 · 跟踪</div>
+      </div>
+    </div>
+
+    <!-- Opportunity Cards -->
+    <div id="opportunity-list" class="space-y-4"></div>
+  </div>
+
+</main>
+
+<script>
+// ── State ──
+let opportunities = [];
+
+// ── Init ──
+async function init() {
+  const res = await fetch('/api/status');
+  const status = await res.json();
+  const badge = document.getElementById('mode-badge');
+  if (status.mode === 'mock') {
+    badge.textContent = '🧪 Mock 模式';
+    badge.classList.add('bg-amber-900/50', 'text-amber-300');
+  } else {
+    badge.textContent = '🌋 火山方舟 · ' + status.model;
+    badge.classList.add('bg-green-900/50', 'text-green-300');
+  }
+  if (status.opportunities_count > 0) {
+    await loadResults();
+  }
+}
+
+// ── Pipeline ──
+async function runPipeline() {
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ 运行中...';
+  document.getElementById('results').classList.add('hidden');
+
+  // Reset steps
+  document.querySelectorAll('.pipeline-step').forEach(s => {
+    s.classList.remove('active', 'done');
+    s.classList.add('pending');
+    const icon = s.querySelector('div');
+    icon.classList.remove('bg-blue-600/30', 'bg-green-600/30');
+    icon.classList.add('bg-slate-700/50');
+  });
+
+  const es = new EventSource('/api/run');
+  const log = document.getElementById('pipeline-log');
+
+  es.addEventListener('agent_start', (e) => {
+    const d = JSON.parse(e.data);
+    log.innerHTML = `<span class="pulse-dot text-blue-400">●</span> ${d.emoji} ${d.agent} 正在运行... (${d.step}/${d.total})`;
+    const step = document.querySelector(`[data-agent="${d.agent}"]`);
+    if (step) {
+      step.classList.remove('pending');
+      step.classList.add('active');
+      step.querySelector('div').classList.remove('bg-slate-700/50');
+      step.querySelector('div').classList.add('bg-blue-600/30');
+    }
+  });
+
+  es.addEventListener('agent_done', (e) => {
+    const d = JSON.parse(e.data);
+    log.innerHTML = `<span class="text-green-400">✓</span> ${d.emoji} ${d.agent} 完成 (${d.elapsed}s, ${d.output_count}条)`;
+    const step = document.querySelector(`[data-agent="${d.agent}"]`);
+    if (step) {
+      step.classList.remove('active');
+      step.classList.add('done');
+      step.querySelector('div').classList.remove('bg-blue-600/30');
+      step.querySelector('div').classList.add('bg-green-600/30');
+    }
+  });
+
+  es.addEventListener('agent_error', (e) => {
+    const d = JSON.parse(e.data);
+    log.innerHTML = `<span class="text-red-400">✗</span> ${d.agent} 出错: ${d.error}`;
+    btn.disabled = false;
+    btn.textContent = '▶ 重新运行';
+    es.close();
+  });
+
+  es.addEventListener('pipeline_done', async (e) => {
+    const d = JSON.parse(e.data);
+    log.innerHTML = `<span class="text-green-400">✓</span> 流水线完成! 发现 ${d.total_opportunities} 条商机 (S:${d.s_count} A:${d.a_count})`;
+    es.close();
+    btn.disabled = false;
+    btn.textContent = '▶ 重新运行';
+    await loadResults();
+  });
+
+  es.onerror = () => {
+    es.close();
+    btn.disabled = false;
+    btn.textContent = '▶ 重新运行';
+  };
+}
+
+// ── Load Results ──
+async function loadResults() {
+  const res = await fetch('/api/opportunities');
+  opportunities = await res.json();
+  renderResults();
+}
+
+function renderResults() {
+  const container = document.getElementById('results');
+  container.classList.remove('hidden');
+
+  // Stats
+  document.getElementById('stat-total').textContent = opportunities.length;
+  document.getElementById('stat-s').textContent = opportunities.filter(o => o.level === 'S').length;
+  document.getElementById('stat-a').textContent = opportunities.filter(o => o.level === 'A').length;
+  document.getElementById('stat-b').textContent = opportunities.filter(o => o.level === 'B').length;
+
+  // Cards
+  const list = document.getElementById('opportunity-list');
+  list.innerHTML = opportunities.map((opp, idx) => renderCard(opp, idx)).join('');
+
+  // Render radar charts
+  opportunities.forEach((opp, idx) => {
+    renderRadar(`radar-${idx}`, opp.radar_data || opp.scores);
+  });
+}
+
+function renderCard(opp, idx) {
+  const cp = opp.company_profile || {};
+  const fl = opp.funding_logic || {};
+  const fp = opp.founder_profile || {};
+  const ct = opp.core_tech || {};
+  const st = opp.star_team || {};
+  const pot = opp.potential || {};
+  const imp = opp.industry_impact || {};
+  const scores = opp.scores || {};
+
+  const levelColors = { S: 'border-red-500/50 bg-red-500/5', A: 'border-orange-500/50 bg-orange-500/5', B: 'border-yellow-500/50 bg-yellow-500/5', C: 'border-slate-500/50' };
+  const levelBadge = { S: 'bg-red-600 text-white', A: 'bg-orange-600 text-white', B: 'bg-yellow-600 text-white', C: 'bg-slate-600 text-white' };
+  const glowClass = opp.level === 'S' ? 'glow-s' : opp.level === 'A' ? 'glow-a' : '';
+
+  return `
+  <div class="glass rounded-xl border ${levelColors[opp.level] || ''} ${glowClass} overflow-hidden fade-in" style="animation-delay:${idx*0.15}s">
+    <!-- Header -->
+    <div class="p-5 pb-4">
+      <div class="flex items-start justify-between mb-3">
+        <div class="flex items-center gap-3">
+          <span class="px-2.5 py-1 rounded-md text-xs font-bold ${levelBadge[opp.level] || ''}">${opp.level}级</span>
+          <span class="text-lg font-bold text-white">${scores.total || '?'}</span>
+          <span class="text-xs text-slate-500">/ 10</span>
+          ${opp.special_tag ? `<span class="px-2 py-0.5 rounded text-xs bg-slate-700 text-slate-300">${opp.special_tag}</span>` : ''}
+        </div>
+        <span class="text-xs text-slate-500">#${idx + 1}</span>
+      </div>
+      <h3 class="text-base font-semibold text-white mb-1">${opp.title || ''}</h3>
+      <p class="text-sm text-slate-400">${opp.one_line_verdict || ''}</p>
+    </div>
+
+    <!-- Seven Dimensions -->
+    <div class="px-5 pb-5 grid grid-cols-2 gap-4">
+      <!-- Left: Details -->
+      <div class="space-y-4 text-sm">
+
+        <!-- 公司做什么 -->
+        <div>
+          <div class="flex items-center gap-2 mb-1.5">
+            <span class="text-slate-500 text-xs font-medium">① 公司做什么</span>
+            ${scoreTag(scores.company)}
+          </div>
+          <p class="text-slate-300 text-xs leading-relaxed">${cp.what_they_do || '-'}</p>
+          <div class="mt-1 flex flex-wrap gap-1">
+            ${(cp.products || []).map(p => `<span class="px-1.5 py-0.5 bg-slate-700/50 rounded text-[10px] text-slate-400">${p}</span>`).join('')}
+          </div>
+        </div>
+
+        <!-- 融资逻辑 -->
+        <div>
+          <div class="flex items-center gap-2 mb-1.5">
+            <span class="text-slate-500 text-xs font-medium">④ 融资逻辑</span>
+            ${scoreTag(scores.funding)}
+          </div>
+          <div class="flex items-center gap-2 mb-1">
+            <span class="px-1.5 py-0.5 bg-blue-900/40 text-blue-300 rounded text-[10px]">${fl.round || '?'}</span>
+            <span class="text-xs text-white font-medium">${fl.amount || '?'}</span>
+          </div>
+          <p class="text-slate-400 text-xs leading-relaxed">${fl.why_fundable || '-'}</p>
+          <div class="mt-1 text-[10px] text-slate-500">投资方: ${(fl.investors || []).join(' · ')}</div>
+        </div>
+
+        <!-- 创始人 -->
+        <div>
+          <div class="flex items-center gap-2 mb-1.5">
+            <span class="text-slate-500 text-xs font-medium">⑤ 创始人</span>
+            ${scoreTag(scores.founder)}
+          </div>
+          <p class="text-xs text-white font-medium">${fp.name || '未知'}</p>
+          <p class="text-xs text-slate-400 mt-0.5">${fp.background_summary || '-'}</p>
+        </div>
+
+        <!-- 核心技术 -->
+        <div>
+          <div class="flex items-center gap-2 mb-1.5">
+            <span class="text-slate-500 text-xs font-medium">⑥ 核心技术</span>
+            ${scoreTag(scores.tech)}
+          </div>
+          ${ct.has_papers ? `<div class="text-[10px] text-green-400 mb-1">📄 有核心论文</div>` : `<div class="text-[10px] text-slate-500 mb-1">📄 无公开论文</div>`}
+          <div class="space-y-0.5">
+            ${(ct.key_papers || []).map(p => `<div class="text-xs text-slate-400">• ${p}</div>`).join('')}
+            ${(ct.open_source || []).map(p => `<div class="text-xs text-slate-400">• 🔓 ${p}</div>`).join('')}
+          </div>
+        </div>
+
+        <!-- 明星团队 -->
+        <div>
+          <div class="flex items-center gap-2 mb-1.5">
+            <span class="text-slate-500 text-xs font-medium">⑦ 团队</span>
+            ${scoreTag(scores.team)}
+          </div>
+          ${st.is_star_team ? `<span class="text-[10px] text-amber-400">⭐ 明星团队</span>` : ''}
+          <div class="space-y-0.5 mt-1">
+            ${(st.signals || []).map(s => `<div class="text-xs text-slate-400">• ${s}</div>`).join('')}
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Radar + Impact + Potential -->
+      <div class="space-y-4">
+        <!-- Radar Chart -->
+        <div class="bg-slate-800/30 rounded-lg p-3">
+          <canvas id="radar-${idx}" width="280" height="220"></canvas>
+        </div>
+
+        <!-- 潜力 -->
+        <div>
+          <div class="flex items-center gap-2 mb-1.5">
+            <span class="text-slate-500 text-xs font-medium">② 潜力</span>
+            ${scoreTag(scores.potential)}
+          </div>
+          <div class="flex items-center gap-2 mb-1">
+            <span class="px-1.5 py-0.5 rounded text-[10px] ${pot.potential_rating==='high'?'bg-green-900/40 text-green-300':pot.potential_rating==='medium'?'bg-yellow-900/40 text-yellow-300':'bg-slate-700 text-slate-400'}">${pot.potential_rating || '?'}</span>
+            <span class="px-1.5 py-0.5 bg-slate-700/50 rounded text-[10px] text-slate-400">${pot.moat_type || '?'}</span>
+          </div>
+          <p class="text-xs text-slate-400">${pot.reasoning || '-'}</p>
+          <p class="text-[10px] text-slate-500 mt-1">市场: ${pot.market_size || '-'}</p>
+        </div>
+
+        <!-- 行业影响 -->
+        <div>
+          <div class="flex items-center gap-2 mb-1.5">
+            <span class="text-slate-500 text-xs font-medium">③ 行业影响</span>
+            ${scoreTag(scores.impact)}
+          </div>
+          <div class="flex items-center gap-2 mb-1">
+            <span class="px-1.5 py-0.5 rounded text-[10px] ${imp.scope==='颠覆性'?'bg-red-900/40 text-red-300':imp.scope==='重大'?'bg-orange-900/40 text-orange-300':'bg-slate-700 text-slate-400'}">${imp.scope || '?'}</span>
+            <span class="text-[10px] text-slate-500">${imp.timeline || ''}</span>
+          </div>
+          <p class="text-xs text-slate-400">${imp.how_it_changes || '-'}</p>
+        </div>
+
+        <!-- Score Breakdown -->
+        <div class="bg-slate-800/30 rounded-lg p-3">
+          <div class="text-xs text-slate-500 mb-2">七维评分明细</div>
+          ${renderScoreBars(scores)}
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function scoreTag(score) {
+  if (!score) return '';
+  const color = score >= 9 ? 'text-green-400' : score >= 7 ? 'text-blue-400' : score >= 5 ? 'text-yellow-400' : 'text-slate-500';
+  return `<span class="${color} text-[10px] font-mono">${score}/10</span>`;
+}
+
+function renderScoreBars(scores) {
+  const dims = [
+    { key: 'company', label: '公司业务', weight: '10%' },
+    { key: 'potential', label: '市场潜力', weight: '20%' },
+    { key: 'impact', label: '行业影响', weight: '15%' },
+    { key: 'funding', label: '融资逻辑', weight: '20%' },
+    { key: 'founder', label: '创始人', weight: '15%' },
+    { key: 'tech', label: '核心技术', weight: '10%' },
+    { key: 'team', label: '团队', weight: '10%' },
+  ];
+  return dims.map(d => {
+    const v = scores[d.key] || 0;
+    const pct = v * 10;
+    const color = v >= 9 ? 'bg-green-500' : v >= 7 ? 'bg-blue-500' : v >= 5 ? 'bg-yellow-500' : 'bg-slate-500';
+    return `<div class="flex items-center gap-2 mb-1.5">
+      <span class="text-[10px] text-slate-500 w-12 shrink-0">${d.label}</span>
+      <div class="flex-1 h-1.5 bg-slate-700/50 rounded-full overflow-hidden">
+        <div class="h-full ${color} rounded-full score-bar" style="width:${pct}%"></div>
+      </div>
+      <span class="text-[10px] text-slate-400 w-4 text-right font-mono">${v}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderRadar(canvasId, data) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const labels = data.labels || ['公司', '潜力', '影响', '融资', '创始人', '技术', '团队'];
+  const values = data.values || [
+    data.company || 5, data.potential || 5, data.impact || 5,
+    data.funding || 5, data.founder || 5, data.tech || 5, data.team || 5
+  ];
+  new Chart(canvas, {
+    type: 'radar',
+    data: {
+      labels: labels,
+      datasets: [{
+        data: values,
+        backgroundColor: 'rgba(59,130,246,0.15)',
+        borderColor: 'rgba(59,130,246,0.6)',
+        borderWidth: 1.5,
+        pointBackgroundColor: 'rgba(59,130,246,0.8)',
+        pointRadius: 3,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        r: {
+          min: 0, max: 10,
+          ticks: { stepSize: 2, display: false },
+          grid: { color: 'rgba(148,163,184,0.1)' },
+          angleLines: { color: 'rgba(148,163,184,0.1)' },
+          pointLabels: { color: '#94a3b8', font: { size: 10 } },
+        }
+      }
+    }
+  });
+}
+
+// ── Boot ──
+init();
+</script>
+</body>
+</html>
