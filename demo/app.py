@@ -212,11 +212,10 @@ class CleanerAgent(BaseAgent):
     emoji = "🧹"
 
     async def run(self, articles: list[dict]) -> list[dict]:
-        results = []
-        for article in articles:
-            cleaned = await self._clean_one(article)
-            results.append(cleaned)
-        return results
+        # 并发处理所有文章，大幅提速
+        tasks = [self._clean_one(article) for article in articles]
+        results = await asyncio.gather(*tasks)
+        return list(results)
 
     async def _clean_one(self, article: dict) -> dict:
         system_prompt = """你是投融资信息提取专家。请只返回一个JSON对象，不要任何解释文字。格式：
@@ -365,12 +364,10 @@ class AnalystAgent(BaseAgent):
     emoji = "🔬"
 
     async def run(self, integrated_data: list[dict]) -> list[dict]:
-        opportunities = []
-        for item in integrated_data:
-            opp = await self._analyze(item)
-            if opp:
-                opportunities.append(opp)
-        return opportunities
+        # 并发分析所有条目
+        tasks = [self._analyze(item) for item in integrated_data]
+        results = await asyncio.gather(*tasks)
+        return [opp for opp in results if opp]
 
     async def _analyze(self, item: dict) -> Optional[dict]:
         system_prompt = """你是云计算和AI商机分析专家。请只返回一个JSON对象，不要任何解释文字。按七大维度分析：
@@ -670,10 +667,9 @@ class EvaluatorAgent(BaseAgent):
     }
 
     async def run(self, opportunities: list[dict]) -> list[dict]:
-        scored = []
-        for opp in opportunities:
-            scored_opp = await self._score(opp)
-            scored.append(scored_opp)
+        # 并发评分
+        tasks = [self._score(opp) for opp in opportunities]
+        scored = list(await asyncio.gather(*tasks))
         # 排序
         scored.sort(key=lambda x: x.get("scores", {}).get("total", 0), reverse=True)
         for i, opp in enumerate(scored):
@@ -840,22 +836,29 @@ class Pipeline:
         self.reporter = ReporterAgent()
 
     async def run(self):
-        """执行完整流水线，yield SSE 事件"""
+        """执行完整流水线，yield SSE 事件（带心跳保活）"""
         agents = [
-            ("crawler", self.crawler, None),
-            ("cleaner", self.cleaner, None),
-            ("integrator", self.integrator, None),
-            ("analyst", self.analyst, None),
-            ("evaluator", self.evaluator, None),
-            ("reporter", self.reporter, None),
+            ("crawler", self.crawler),
+            ("cleaner", self.cleaner),
+            ("integrator", self.integrator),
+            ("analyst", self.analyst),
+            ("evaluator", self.evaluator),
+            ("reporter", self.reporter),
         ]
 
         data = None
-        for i, (name, agent, _) in enumerate(agents):
+        for i, (name, agent) in enumerate(agents):
             yield self._event("agent_start", {"agent": name, "emoji": agent.emoji, "step": i + 1, "total": len(agents)})
             try:
                 start = time.time()
-                data = await agent.run(data)
+                # 用心跳包裹长时间运行的 agent
+                task = asyncio.create_task(agent.run(data))
+                while not task.done():
+                    await asyncio.sleep(3)
+                    if not task.done():
+                        elapsed_so_far = round(time.time() - start, 1)
+                        yield self._event("heartbeat", {"agent": name, "elapsed": elapsed_so_far})
+                data = task.result()
                 elapsed = round(time.time() - start, 2)
                 count = len(data) if isinstance(data, list) else 1
                 yield self._event("agent_done", {"agent": name, "emoji": agent.emoji, "elapsed": elapsed, "output_count": count})

@@ -166,6 +166,11 @@ async function runPipeline() {
     }
   });
 
+  es.addEventListener('heartbeat', (e) => {
+    const d = JSON.parse(e.data);
+    log.innerHTML = `<span class="pulse-dot text-blue-400">●</span> ${d.agent} 调用大模型中... ${d.elapsed}s`;
+  });
+
   es.addEventListener('agent_done', (e) => {
     const d = JSON.parse(e.data);
     log.innerHTML = `<span class="text-green-400">✓</span> ${d.emoji} ${d.agent} 完成 (${d.elapsed}s, ${d.output_count}条)`;
