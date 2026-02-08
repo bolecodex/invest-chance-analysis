@@ -32,6 +32,12 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 USE_MOCK = not OPENAI_API_KEY or OPENAI_API_KEY in ("sk-your-key-here", "your-ark-api-key-here")
 
+# 联网问答智能体配置
+WEB_AGENT_API_KEY = os.getenv("WEB_AGENT_API_KEY", "")
+WEB_AGENT_BOT_ID = os.getenv("WEB_AGENT_BOT_ID", "7563185232485123593")
+WEB_AGENT_URL = "https://open.feedcoopapi.com/agent_api/agent/chat/completion"
+USE_WEB_AGENT = bool(WEB_AGENT_API_KEY) and WEB_AGENT_API_KEY != "your-web-agent-api-key-here"
+
 # 内存数据库
 db: dict[str, list] = {
     "articles": [],
@@ -176,6 +182,72 @@ async def call_llm(system_prompt: str, user_prompt: str) -> dict:
     except Exception as e:
         print(f"  [LLM Error] {type(e).__name__}: {e}")
         return {}  # 出错时回退到 Mock
+
+
+async def call_web_agent(query: str) -> dict:
+    """调用火山引擎联网问答智能体 API，返回联网搜索结果（含内容、参考链接、图片、卡片）"""
+    if not USE_WEB_AGENT:
+        return {}
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                WEB_AGENT_URL,
+                headers={
+                    "Authorization": f"Bearer {WEB_AGENT_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "bot_id": WEB_AGENT_BOT_ID,
+                    "stream": False,
+                    "messages": [{"role": "user", "content": query}],
+                },
+            )
+            data = resp.json()
+
+        if "error" in data:
+            print(f"  [WebAgent Error] {data['error'].get('message', '')}")
+            return {}
+
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        references = data.get("references", []) or []
+        cards = data.get("cards", []) or []
+
+        # 提取图片 URL
+        images = []
+        # 1) 从 cards 中提取 image_card 图片（最可靠的来源）
+        for card in cards:
+            ic = card.get("image_card", {})
+            if ic.get("image_url"):
+                images.append({
+                    "url": ic["image_url"],
+                    "title": ic.get("title", ""),
+                    "width": ic.get("width", 0),
+                    "height": ic.get("height", 0),
+                    "source_url": ic.get("source_image_url", ""),
+                })
+        # 2) 从 references 的 cover_image 中提取
+        for ref in references:
+            ci = ref.get("cover_image")
+            if ci and ci.get("url"):
+                images.append({"url": ci["url"], "title": ref.get("title", ""), "source_url": ref.get("url", "")})
+
+        # 提取参考链接
+        links = []
+        for ref in references:
+            if ref.get("url"):
+                links.append({"title": ref.get("title", ""), "url": ref["url"], "source_type": ref.get("source_type", ""), "site_name": ref.get("site_name", "")})
+
+        return {
+            "content": content,
+            "references": links[:10],
+            "images": images[:8],
+            "cards": cards[:5],
+        }
+    except Exception as e:
+        print(f"  [WebAgent Error] {type(e).__name__}: {e}")
+        return {}
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -336,23 +408,70 @@ class IntegratorAgent(BaseAgent):
     emoji = "🧩"
 
     async def run(self, cleaned_articles: list[dict]) -> list[dict]:
-        results = []
-        for item in cleaned_articles:
-            score = item.get("completeness_score", 0)
-            if score < 0.7:
-                item = await self._supplement(item)
-            item["integration_status"] = "supplemented" if score < 0.7 else "passed"
-            results.append(item)
+        # 并发搜索所有公司的补充信息
+        tasks = [self._enrich(item) for item in cleaned_articles]
+        results = list(await asyncio.gather(*tasks))
         return results
 
-    async def _supplement(self, item: dict) -> dict:
-        """模拟通过 MCP 工具补充信息"""
-        await asyncio.sleep(0.3)
-        # 在真实场景中，这里会调用投融资数据MCP、学术搜索MCP等
-        item["completeness_score"] = min(item.get("completeness_score", 0) + 0.15, 1.0)
-        item.setdefault("integration_notes", []).append(
-            "通过投融资数据MCP补充了缺失字段"
-        )
+    async def _noop(self) -> dict:
+        return {}
+
+    async def _enrich(self, item: dict) -> dict:
+        """为每家公司做多次专项联网搜索，补充产品图片、论文链接、联系方式、用户数据"""
+        company = item.get("funding_company", item.get("title", ""))
+        founder = item.get("founder_name", "")
+        products = ", ".join(item.get("tech_clues", [])[:3])
+        score = item.get("completeness_score", 0)
+
+        if USE_WEB_AGENT and company:
+            # 提取产品名用于搜索
+            product_names = []
+            for c in item.get("team_clues", [])[:1]:  # 只取第一个
+                product_names.append(c)
+            company_desc = item.get("company_desc", "")
+            short_desc = company_desc[:30] if company_desc else ""
+
+            # 并发执行 3 个专项搜索
+            search_tasks = [
+                # 搜索1: 从官网获取产品截图（搜"官网产品介绍页"获取带封面图的引用）
+                call_web_agent(f"{company} 官网产品介绍页 功能展示"),
+                # 搜索2: 论文链接（如果有论文线索）
+                call_web_agent(f"{founder} {products} 论文 arxiv 链接") if (founder and item.get("tech_clues")) else self._noop(),
+                # 搜索3: 公司信息+融资+联系人+联系方式+用户数据
+                call_web_agent(f"{company} {founder} 官网 联系人 联系方式 邮箱 电话 用户规模 日活 月活 MRR ARR 融资历史"),
+            ]
+            results = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+            # 搜索1结果: 产品图片 + 公司信息
+            product_result = results[0] if not isinstance(results[0], Exception) else {}
+            if product_result:
+                item["web_product_content"] = product_result.get("content", "")[:2000]
+                item["web_product_images"] = product_result.get("images", [])  # 直接用 call_web_agent 已提取的图片
+                item["web_product_references"] = product_result.get("references", [])
+
+            # 搜索2结果: 论文链接
+            paper_result = results[1] if not isinstance(results[1], Exception) else {}
+            if paper_result:
+                item["web_paper_content"] = paper_result.get("content", "")[:2000]
+                item["web_paper_references"] = paper_result.get("references", [])
+
+            # 搜索3结果: 融资历史 + 创始人
+            info_result = results[2] if not isinstance(results[2], Exception) else {}
+            if info_result:
+                item["web_company_content"] = info_result.get("content", "")[:2000]
+                item["web_company_references"] = info_result.get("references", [])
+
+            item.setdefault("integration_notes", []).append(
+                f"通过联网问答智能体完成 {company} 的3项专项搜索（产品图片/论文链接/公司信息）"
+            )
+            score = min(score + 0.2, 1.0)
+        elif score < 0.7:
+            await asyncio.sleep(0.3)
+            item.setdefault("integration_notes", []).append("通过投融资数据MCP补充了缺失字段")
+            score = min(score + 0.15, 1.0)
+
+        item["completeness_score"] = score
+        item["integration_status"] = "web_enriched" if USE_WEB_AGENT else ("supplemented" if score >= 0.7 else "passed")
         return item
 
 
@@ -372,17 +491,19 @@ class AnalystAgent(BaseAgent):
     async def _analyze(self, item: dict) -> Optional[dict]:
         system_prompt = """你是云计算和AI商机分析专家。请只返回一个JSON对象，不要任何解释文字。按七大维度分析：
 {
-  "id": "opp-xxx",
-  "title": "商机标题（简洁有力）",
+  "title": "商机标题",
   "summary": "一句话概述",
   "domain": "cloud | ai | cloud+ai",
   "signal_type": "融资事件 | 并购合作 | 产品发布 | 技术突破",
+  "industry_tags": ["行业标签，如：大模型、云安全、AI Agent、SaaS、容器安全等，2-4个"],
   "company_profile": {
     "name": "公司名",
+    "website_url": "公司官网URL（如已知，否则空字符串）",
     "what_they_do": "用通俗语言描述公司做什么（2-3句话）",
-    "products": ["产品列表"],
+    "product_lines": [{"name":"产品名","description":"一句话描述","screenshot_url":"产品截图URL（如有）","metrics":{"users":"用户规模","dau":"日活跃用户","wau":"周活跃用户","retention":"留存率","mrr":"月经常性收入MRR","arr":"年经常性收入ARR"}}],
     "business_model": "商业模式",
-    "stage": "seed | early | growth | mature"
+    "stage": "seed | early | growth | mature",
+    "contact": {"name":"联系人姓名（创始人/CEO/PR负责人）","email":"","phone":"","wechat":"（如文章中提及联系方式）"}
   },
   "potential": {
     "market_size": "目标市场规模描述",
@@ -397,35 +518,68 @@ class AnalystAgent(BaseAgent):
     "timeline": "影响显现时间"
   },
   "funding_logic": {
-    "round": "融资轮次",
-    "amount": "金额",
-    "investors": ["投资方"],
-    "why_fundable": "为什么资本愿意投（2-3句话分析融资逻辑）",
-    "investor_signal": "投资方阵容传递的信号"
+    "current_round": "本轮融资轮次",
+    "current_amount": "本轮金额",
+    "investors": ["本轮投资方"],
+    "lead_investor": "领投方",
+    "why_fundable": "为什么资本愿意投",
+    "investor_signal": "投资方阵容传递的信号",
+    "funding_history": [{"round":"轮次","amount":"金额","date":"时间","investors":["投资方"],"lead":"领投方"}]
   },
   "founder_profile": {
     "name": "创始人姓名",
-    "background_summary": "创始人背景一句话总结",
-    "highlights": ["关键亮点"],
+    "background_summary": "创始人背景总结",
+    "highlights": ["关键亮点，包含之前工作过的公司和岗位"],
     "rating": "strong | average | unknown"
   },
   "core_tech": {
     "has_papers": true,
-    "key_papers": ["论文简述"],
-    "open_source": ["开源项目"],
+    "papers": [{"title":"论文标题","venue":"发表会议/期刊","url":"论文URL如Google Scholar链接","citations":"引用数"}],
+    "open_source_projects": [{"name":"项目名","url":"GitHub URL","stars":"Star数"}],
     "originality": "原创突破 | 工程创新 | 应用集成 | 跟随复制",
     "rating": "cutting_edge | solid | average | weak"
   },
   "star_team": {
     "is_star_team": true,
     "signals": ["明星信号"],
+    "key_members": [{"name":"姓名","role":"职位","background":"一句话背景"}],
     "rating": "all_star | strong | average | unknown"
   },
   "time_sensitivity": "urgent | short_term | medium_term | long_term",
   "confidence": 0.85
-}"""
+}
+注意：
+- 所有URL如果不确定，填空字符串""
+- 融资历史funding_history必须按时间从早到晚列出所有已知轮次
+- 产品metrics中的数据如文中未明确提及，填"未披露"
+- 如果有web_search_content补充信息，从中提取产品数据指标、官网URL、截图等"""
 
-        user_prompt = f"清洗后的文章数据:\n{json.dumps(item, ensure_ascii=False, indent=2)}"
+        # 构建 user prompt，附带联网搜索补充信息（如有）
+        # 移除大体积web搜索原始数据，只传精简的结构化提示
+        slim_item = {k: v for k, v in item.items() if not k.startswith("web_")}
+        user_input = f"清洗后的文章数据:\n{json.dumps(slim_item, ensure_ascii=False, indent=2)}"
+
+        # 产品图片信息
+        product_images = item.get("web_product_images", [])
+        if product_images:
+            user_input += f"\n\n【联网搜索到的产品相关图片】（请选取最相关的填入product_lines的screenshot_url）:\n"
+            for img in product_images[:5]:
+                user_input += f"- {img.get('title','')}: {img.get('url','')}\n"
+
+        # 论文链接信息
+        paper_content = item.get("web_paper_content", "")
+        if paper_content:
+            user_input += f"\n\n【联网搜索到的论文信息】（请提取arxiv链接填入papers的url字段）:\n{paper_content[:1000]}"
+
+        # 公司详情（融资+联系方式+用户数据）
+        company_content = item.get("web_company_content", "")
+        product_content = item.get("web_product_content", "")
+        if company_content:
+            user_input += f"\n\n【联网搜索到的公司信息】（提取融资历史/联系方式/用户数据/DAU/MRR等）:\n{company_content[:1000]}"
+        if product_content:
+            user_input += f"\n\n【联网搜索到的产品信息】（提取用户规模/日活/留存/收入等）:\n{product_content[:1000]}"
+
+        user_prompt = user_input
         result = await call_llm(system_prompt, user_prompt)
 
         if not result:
@@ -434,22 +588,32 @@ class AnalystAgent(BaseAgent):
         result["id"] = f"opp-{uuid.uuid4().hex[:8]}"
         result["source_article_id"] = item.get("article_id", "")
         result["created_at"] = datetime.now().isoformat()
+        # 透传联网搜索原始数据给 Reporter（用于补充图片和链接）
+        result["web_product_images"] = item.get("web_product_images", [])
+        result["web_paper_content"] = item.get("web_paper_content", "")
+        result["web_paper_references"] = item.get("web_paper_references", [])
         return result
 
     def _mock_analyze(self, item: dict) -> dict:
         company = item.get("funding_company", "未知公司")
         mocks = {
             "月之暗面 (Moonshot AI)": {
-                "title": f"月之暗面超10亿美元融资 — 国产大模型头部玩家加速商业化",
+                "title": "月之暗面超10亿美元融资 — 国产大模型头部玩家加速商业化",
                 "summary": "月之暗面以Kimi产品切入长文本赛道，凭借顶级团队和明星资本持续融资，估值跻身国内大模型第一梯队",
                 "domain": "ai",
                 "signal_type": "融资事件",
+                "industry_tags": ["大模型", "AI应用", "自然语言处理"],
                 "company_profile": {
                     "name": "月之暗面 (Moonshot AI)",
+                    "website_url": "https://www.moonshot.cn",
                     "what_they_do": "开发大语言模型，核心产品Kimi智能助手以超长上下文窗口（200万字）为差异化卖点，面向C端用户提供AI对话和内容理解服务",
-                    "products": ["Kimi智能助手", "Moonshot API"],
+                    "product_lines": [
+                        {"name": "Kimi智能助手", "description": "面向C端的超长上下文AI对话助手，支持200万字输入", "screenshot_url": "", "metrics": {"users": "月活1200万+", "dau": "约400万", "wau": "约800万", "retention": "次日留存约45%", "mrr": "未披露", "arr": "未披露"}},
+                        {"name": "Moonshot API", "description": "面向B端开发者的大模型API服务，支持长文本理解和生成", "screenshot_url": "", "metrics": {"users": "开发者数千", "dau": "未披露", "wau": "未披露", "retention": "未披露", "mrr": "未披露", "arr": "未披露"}},
+                    ],
                     "business_model": "C端免费+增值订阅 / B端API按量计费",
                     "stage": "growth",
+                    "contact": {"name": "杨植麟 (CEO)", "email": "", "phone": "", "wechat": ""},
                 },
                 "potential": {
                     "market_size": "中国大模型市场2025年规模约200亿元，预计2027年突破600亿元",
@@ -464,30 +628,36 @@ class AnalystAgent(BaseAgent):
                     "timeline": "12-18个月内竞争格局将进一步清晰",
                 },
                 "funding_logic": {
-                    "round": "B轮",
-                    "amount": "超10亿美元",
+                    "current_round": "B轮",
+                    "current_amount": "超10亿美元",
                     "investors": ["红杉中国", "小红书", "阿里巴巴", "美团", "蓝驰创投"],
+                    "lead_investor": "红杉中国、小红书",
                     "why_fundable": "创始人杨植麟是Transformer-XL/XLNet作者，论文引用8000+次，学术影响力顶级；Kimi产品月活破千万验证了市场需求；大模型赛道是当前一级市场最热赛道，顶级VC争相布局",
                     "investor_signal": "红杉中国连续加注+互联网巨头(阿里/美团)战略投资，说明产业界看好其商业化潜力",
+                    "funding_history": [
+                        {"round": "天使轮", "amount": "约2000万美元", "date": "2023年6月", "investors": ["红杉中国"], "lead": "红杉中国"},
+                        {"round": "A轮", "amount": "约10亿美元", "date": "2023年12月", "investors": ["多家机构联合"], "lead": "未披露"},
+                        {"round": "B轮", "amount": "超10亿美元", "date": "2026年1月", "investors": ["红杉中国", "小红书", "阿里巴巴", "美团", "蓝驰创投"], "lead": "红杉中国、小红书"},
+                    ],
                 },
                 "founder_profile": {
                     "name": "杨植麟",
                     "background_summary": "清华CS本科→CMU博士→Google Brain，Transformer-XL/XLNet论文一作，引用超8000次",
                     "highlights": [
-                        "清华大学计算机系",
-                        "CMU博士（导师为苹果AI负责人）",
-                        "Google Brain 研究经历",
-                        "Transformer-XL/XLNet 一作（引用8000+）",
+                        "清华大学计算机系毕业",
+                        "卡内基梅隆大学(CMU)博士，导师为苹果AI负责人 Ruslan Salakhutdinov",
+                        "前Google Brain实习研究员",
+                        "Transformer-XL/XLNet论文一作（引用8000+）",
                     ],
                     "rating": "strong",
                 },
                 "core_tech": {
                     "has_papers": True,
-                    "key_papers": [
-                        "Transformer-XL (NeurIPS, 引用~5000)",
-                        "XLNet (NeurIPS, 引用~3000)",
+                    "papers": [
+                        {"title": "Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context", "venue": "NeurIPS 2019", "url": "https://scholar.google.com/scholar?q=Transformer-XL", "citations": "~5000"},
+                        {"title": "XLNet: Generalized Autoregressive Pretraining for Language Understanding", "venue": "NeurIPS 2019", "url": "https://scholar.google.com/scholar?q=XLNet", "citations": "~3000"},
                     ],
-                    "open_source": [],
+                    "open_source_projects": [],
                     "originality": "原创突破",
                     "rating": "cutting_edge",
                 },
@@ -499,6 +669,9 @@ class AnalystAgent(BaseAgent):
                         "核心团队来自清华/Google Brain/Meta AI",
                         "团队200人规模",
                     ],
+                    "key_members": [
+                        {"name": "杨植麟", "role": "创始人/CEO", "background": "清华CS→CMU博士→Google Brain，Transformer-XL/XLNet一作"},
+                    ],
                     "rating": "all_star",
                 },
                 "time_sensitivity": "urgent",
@@ -509,12 +682,17 @@ class AnalystAgent(BaseAgent):
                 "summary": "探真科技切入K8s容器安全细分赛道，创始人有阿里云安全背景，经纬领投看好云安全增长",
                 "domain": "cloud",
                 "signal_type": "融资事件",
+                "industry_tags": ["云安全", "容器安全", "云原生", "Kubernetes"],
                 "company_profile": {
                     "name": "探真科技",
+                    "website_url": "",
                     "what_they_do": "提供云原生环境下的安全检测与防护，核心产品面向Kubernetes环境，覆盖容器镜像扫描、运行时威胁检测和合规审计",
-                    "products": ["探真云卫"],
+                    "product_lines": [
+                        {"name": "探真云卫", "description": "面向K8s环境的安全平台，提供容器镜像扫描、运行时威胁检测和合规审计", "screenshot_url": "", "metrics": {"users": "50+企业客户", "dau": "未披露", "wau": "未披露", "retention": "未披露", "mrr": "预估百万级", "arr": "预估千万级"}},
+                    ],
                     "business_model": "SaaS订阅 + 私有化部署",
                     "stage": "early",
+                    "contact": {"name": "李明辉 (CEO)", "email": "", "phone": "", "wechat": ""},
                 },
                 "potential": {
                     "market_size": "中国云安全市场2025年187亿元，云原生安全子赛道预计2027年达80亿元",
@@ -529,17 +707,22 @@ class AnalystAgent(BaseAgent):
                     "timeline": "6-12个月",
                 },
                 "funding_logic": {
-                    "round": "A轮",
-                    "amount": "数千万元人民币",
+                    "current_round": "A轮",
+                    "current_amount": "数千万元人民币",
                     "investors": ["经纬创投", "红点中国"],
+                    "lead_investor": "经纬创投",
                     "why_fundable": "云安全赛道增长确定性高（25%+），创始人有阿里云安全一线实战经验，50+付费客户验证了产品价值",
                     "investor_signal": "经纬创投在安全赛道有多个成功案例，领投说明对云安全方向持续看好",
+                    "funding_history": [
+                        {"round": "天使轮", "amount": "未披露", "date": "2024年初", "investors": ["红点中国"], "lead": "红点中国"},
+                        {"round": "A轮", "amount": "数千万元人民币", "date": "2026年1月", "investors": ["经纬创投", "红点中国"], "lead": "经纬创投"},
+                    ],
                 },
                 "founder_profile": {
                     "name": "李明辉",
                     "background_summary": "15年安全老兵，前阿里云安全产品线负责人，前绿盟科技高级研究员",
                     "highlights": [
-                        "15年网络安全经验",
+                        "15年网络安全从业经验",
                         "前阿里云安全产品线负责人",
                         "前绿盟科技高级研究员",
                     ],
@@ -547,16 +730,22 @@ class AnalystAgent(BaseAgent):
                 },
                 "core_tech": {
                     "has_papers": True,
-                    "key_papers": ["CTO在IEEE S&P/USENIX Security发表论文"],
-                    "open_source": [],
+                    "papers": [
+                        {"title": "CTO王磊在IEEE S&P/USENIX Security发表多篇安全领域论文", "venue": "IEEE S&P / USENIX Security", "url": "", "citations": ""},
+                    ],
+                    "open_source_projects": [],
                     "originality": "工程创新",
                     "rating": "solid",
                 },
                 "star_team": {
                     "is_star_team": False,
                     "signals": [
-                        "创始人阿里云安全背景",
-                        "CTO清华安全博士+顶会论文",
+                        "创始人前阿里云安全产品线负责人",
+                        "CTO清华网络安全博士+顶会论文",
+                    ],
+                    "key_members": [
+                        {"name": "李明辉", "role": "创始人/CEO", "background": "15年安全经验，前阿里云安全产品线负责人"},
+                        {"name": "王磊", "role": "CTO", "background": "清华大学网络安全博士，IEEE S&P/USENIX Security论文作者"},
                     ],
                     "rating": "strong",
                 },
@@ -568,12 +757,18 @@ class AnalystAgent(BaseAgent):
                 "summary": "前OpenAI工程师创业做Agent编排平台，ReAct论文加持，赛道正热但竞争激烈",
                 "domain": "ai",
                 "signal_type": "融资事件",
+                "industry_tags": ["AI Agent", "工作流自动化", "低代码", "大模型应用"],
                 "company_profile": {
                     "name": "FlowAgent",
+                    "website_url": "",
                     "what_they_do": "低代码AI Agent编排平台，让企业用户通过拖拽方式构建复杂AI工作流，支持多模型调度、工具调用和人机协作",
-                    "products": ["FlowAgent Platform", "FlowEngine (开源)"],
+                    "product_lines": [
+                        {"name": "FlowAgent Platform", "description": "低代码AI Agent编排平台，拖拽构建工作流，支持多模型调度", "screenshot_url": "", "metrics": {"users": "200家企业内测申请", "dau": "内测阶段未公开", "wau": "内测阶段未公开", "retention": "未披露", "mrr": "尚未商业化", "arr": "尚未商业化"}},
+                        {"name": "FlowEngine", "description": "开源核心推理框架，支持ReAct/CoT等推理模式", "screenshot_url": "", "metrics": {"users": "GitHub 3.2k Stars", "dau": "未披露", "wau": "未披露", "retention": "未披露", "mrr": "开源免费", "arr": "开源免费"}},
+                    ],
                     "business_model": "SaaS订阅（按工作流调用量计费）",
                     "stage": "seed",
+                    "contact": {"name": "张涵 (CEO)", "email": "", "phone": "", "wechat": ""},
                 },
                 "potential": {
                     "market_size": "全球AI Agent市场2025年融资超50亿美元，企业级Agent平台赛道处于早期爆发阶段",
@@ -588,11 +783,15 @@ class AnalystAgent(BaseAgent):
                     "timeline": "18-24个月",
                 },
                 "funding_logic": {
-                    "round": "种子轮",
-                    "amount": "500万美元",
+                    "current_round": "种子轮",
+                    "current_amount": "500万美元",
                     "investors": ["真格基金", "奇绩创坛"],
+                    "lead_investor": "真格基金",
                     "why_fundable": "创始人有OpenAI+斯坦福背景，ReAct论文是Agent领域奠基性工作；AI Agent赛道正热，投资人抢跑布局早期项目",
                     "investor_signal": "真格+奇绩是典型天使/种子轮强势投资方，说明对创始人个人能力高度认可",
+                    "funding_history": [
+                        {"round": "种子轮", "amount": "500万美元", "date": "2026年2月", "investors": ["真格基金", "奇绩创坛"], "lead": "真格基金"},
+                    ],
                 },
                 "founder_profile": {
                     "name": "张涵",
@@ -600,17 +799,19 @@ class AnalystAgent(BaseAgent):
                     "highlights": [
                         "北京大学计算机系本科",
                         "斯坦福大学AI Lab博士",
-                        "前OpenAI研究工程师（参与GPT-4）",
+                        "前OpenAI研究工程师（参与GPT-4 RLHF训练）",
                         "ReAct论文引用超2000次",
                     ],
                     "rating": "strong",
                 },
                 "core_tech": {
                     "has_papers": True,
-                    "key_papers": [
-                        "ReAct: Synergizing Reasoning and Acting (引用2000+)"
+                    "papers": [
+                        {"title": "ReAct: Synergizing Reasoning and Acting in Language Models", "venue": "ICLR 2023", "url": "https://scholar.google.com/scholar?q=ReAct+Synergizing+Reasoning+Acting", "citations": "2000+"},
                     ],
-                    "open_source": ["FlowEngine (GitHub 3.2k Stars)"],
+                    "open_source_projects": [
+                        {"name": "FlowEngine", "url": "https://github.com/flowagent/flowengine", "stars": "3.2k"},
+                    ],
                     "originality": "原创突破",
                     "rating": "cutting_edge",
                 },
@@ -621,6 +822,10 @@ class AnalystAgent(BaseAgent):
                         "斯坦福AI Lab博士",
                         "ReAct论文引用2000+",
                         "联合创始人前字节飞书技术负责人",
+                    ],
+                    "key_members": [
+                        {"name": "张涵", "role": "创始人/CEO", "background": "北大→斯坦福AI Lab博士→前OpenAI研究工程师"},
+                        {"name": "刘思远", "role": "联合创始人/CTO", "background": "前字节跳动飞书团队技术负责人，企业级SaaS专家"},
                     ],
                     "rating": "all_star",
                 },
@@ -774,12 +979,15 @@ class ReporterAgent(BaseAgent):
         }
         special = tag_map.get(opp.get("special_tag", "none"), "")
 
+        # 提取产品名列表（兼容新旧格式）
+        product_names = [p.get("name", p) if isinstance(p, dict) else p for p in cp.get("product_lines", cp.get("products", []))]
+
         # 生成 Mermaid 流程图代码
         mermaid_code = f"""graph LR
     A["{cp.get('name', '公司')}"] --> B["核心产品"]
-    B --> C["{', '.join(cp.get('products', ['产品'])[:2])}"]
+    B --> C["{', '.join(product_names[:2])}"]
     A --> D["融资"]
-    D --> E["{fl.get('round', '?')} {fl.get('amount', '?')}"]
+    D --> E["{fl.get('current_round', fl.get('round', '?'))} {fl.get('current_amount', fl.get('amount', '?'))}"]
     A --> F["技术"]
     F --> G["{ct.get('originality', '?')}"]"""
 
@@ -797,6 +1005,55 @@ class ReporterAgent(BaseAgent):
             ],
         }
 
+        # ── 从联网搜索补充产品图片（过滤掉 logo 和不相关图片）──
+        web_images = opp.get("web_product_images", [])
+        # 过滤: 跳过 title 中含 logo/图标/icon 的图片，以及尺寸太小的图片（可能是icon）
+        logo_keywords = ["logo", "图标", "icon", "favicon", "avatar", "头像"]
+        filtered_images = [
+            img for img in web_images
+            if not any(kw in (img.get("title", "") or "").lower() for kw in logo_keywords)
+            and img.get("width", 999) > 100 and img.get("height", 999) > 100
+        ]
+        product_lines = cp.get("product_lines", [])
+        img_idx = 0
+        for pl in product_lines:
+            if isinstance(pl, dict) and not pl.get("screenshot_url") and img_idx < len(filtered_images):
+                pl["screenshot_url"] = filtered_images[img_idx].get("url", "")
+                pl["screenshot_title"] = filtered_images[img_idx].get("title", "")
+                img_idx += 1
+        extra_images = filtered_images[img_idx:]
+
+        # ── 从联网搜索补充论文链接 ──
+        # 从 web_paper_content 中提取 arxiv 链接
+        paper_content = opp.get("web_paper_content", "")
+        import re
+        arxiv_links = re.findall(r'https?://arxiv\.org/[^\s\]）)]+', paper_content)
+        papers = ct.get("papers", ct.get("key_papers", []))
+        for i, p in enumerate(papers):
+            if isinstance(p, dict) and not p.get("url") and i < len(arxiv_links):
+                p["url"] = arxiv_links[i]
+        # 如果 papers 是旧格式（字符串列表），转为带链接的结构
+        if papers and isinstance(papers[0], str):
+            new_papers = []
+            for i, title in enumerate(papers):
+                new_papers.append({
+                    "title": title,
+                    "venue": "",
+                    "url": arxiv_links[i] if i < len(arxiv_links) else "",
+                    "citations": "",
+                })
+            ct["papers"] = new_papers
+
+        # ── 从联网搜索的 references 补充论文链接（如果 arxiv 不够）──
+        paper_refs = opp.get("web_paper_references", [])
+        for p in papers:
+            if isinstance(p, dict) and not p.get("url"):
+                # 尝试从 references 中匹配
+                for ref in paper_refs:
+                    if ref.get("url") and ("arxiv" in ref.get("url", "") or "scholar" in ref.get("url", "")):
+                        p["url"] = ref["url"]
+                        break
+
         return {
             "opportunity_id": opp.get("id", ""),
             "title": opp.get("title", ""),
@@ -806,6 +1063,7 @@ class ReporterAgent(BaseAgent):
             "special_tag": special,
             "total_score": scores.get("total", 0),
             "one_line_verdict": opp.get("one_line_verdict", ""),
+            "industry_tags": opp.get("industry_tags", []),
             "company_profile": cp,
             "potential": pot,
             "industry_impact": imp,
@@ -816,6 +1074,7 @@ class ReporterAgent(BaseAgent):
             "scores": scores,
             "radar_data": radar_data,
             "mermaid_code": mermaid_code,
+            "extra_images": extra_images[:3],
             "source_article_id": opp.get("source_article_id", ""),
             "created_at": opp.get("created_at", ""),
         }
